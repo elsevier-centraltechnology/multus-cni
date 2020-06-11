@@ -530,6 +530,30 @@ func cmdAdd(args *skel.CmdArgs, exec invoke.Exec, kubeClient *k8s.ClientInfo) (c
 		}
 	}
 
+	namespace := (*v1.Namespace)(nil)
+	if kubeClient != nil {
+		namespace, err = kubeClient.GetNamespace(string(k8sArgs.K8S_POD_NAMESPACE))
+		if err != nil {
+			var waitErr error
+			// in case of ServiceUnavailable, retry 10 times with 0.5 sec interval
+			if errors.IsServiceUnavailable(err) {
+				pollDuration := 500 * time.Millisecond
+				pollTimeout := 5 * time.Second
+				waitErr = wait.PollImmediate(pollDuration, pollTimeout, func() (bool, error) {
+					namespace, err = kubeClient.GetNamespace(string(k8sArgs.K8S_POD_NAMESPACE))
+					return namespace != nil, err
+				})
+				// retry failed, then return error with retry out
+				if waitErr != nil {
+					return nil, cmdErr(k8sArgs, "error getting namespace by service unavailable: %v", err)
+				}
+			} else {
+				// Other case, return error
+				return nil, cmdErr(k8sArgs, "error getting namespace: %v", err)
+			}
+		}
+	}
+
 	// resourceMap holds Pod device allocation information; only initizized if CRD contains 'resourceName' annotation.
 	// This will only be initialized once and all delegate objects can reference this to look up device info.
 	var resourceMap map[string]*types.ResourceInfo
@@ -543,7 +567,12 @@ func cmdAdd(args *skel.CmdArgs, exec invoke.Exec, kubeClient *k8s.ClientInfo) (c
 		n.Delegates[0].MasterPlugin = true
 	}
 
-	_, kc, err := k8s.TryLoadPodDelegates(pod, n, kubeClient, resourceMap)
+	_, kc, err := k8s.TryLoadNamespaceDelegates(namespace, pod, n, kubeClient, resourceMap)
+	if err != nil {
+		return nil, cmdErr(k8sArgs, "error loading k8s delegates k8s args: %v", err)
+	}
+
+	_, kc, err = k8s.TryLoadPodDelegates(pod, n, kubeClient, resourceMap)
 	if err != nil {
 		return nil, cmdErr(k8sArgs, "error loading k8s delegates k8s args: %v", err)
 	}

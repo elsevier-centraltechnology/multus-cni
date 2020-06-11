@@ -37,12 +37,12 @@ import (
 	"github.com/containernetworking/cni/libcni"
 	"github.com/containernetworking/cni/pkg/skel"
 	cnitypes "github.com/containernetworking/cni/pkg/types"
-	"gopkg.in/intel/multus-cni.v3/kubeletclient"
-	"gopkg.in/intel/multus-cni.v3/logging"
-	"gopkg.in/intel/multus-cni.v3/types"
 	nettypes "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	netclient "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/client/clientset/versioned/typed/k8s.cni.cncf.io/v1"
 	netutils "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/utils"
+	"gopkg.in/intel/multus-cni.v3/kubeletclient"
+	"gopkg.in/intel/multus-cni.v3/logging"
+	"gopkg.in/intel/multus-cni.v3/types"
 )
 
 const (
@@ -72,6 +72,11 @@ func (c *ClientInfo) AddPod(pod *v1.Pod) (*v1.Pod, error) {
 // GetPod gets pod from kubernetes
 func (c *ClientInfo) GetPod(namespace, name string) (*v1.Pod, error) {
 	return c.Client.Core().Pods(namespace).Get(name, metav1.GetOptions{})
+}
+
+// GetNamespace gets namespace from kubernetes
+func (c *ClientInfo) GetNamespace(namespace string) (*v1.Namespace, error) {
+	return c.Client.Core().Namespaces().Get(namespace, metav1.GetOptions{})
 }
 
 // DeletePod deletes a pod from kubernetes
@@ -299,6 +304,70 @@ func GetK8sArgs(args *skel.CmdArgs) (*types.K8sArgs, error) {
 	return k8sArgs, nil
 }
 
+// TryLoadNamespaceDelegates attempts to load Kubernetes-defined delegates and add them to the Multus config.
+// Returns the number of Kubernetes-defined delegates added or an error.
+func TryLoadNamespaceDelegates(namespace *v1.Namespace, pod *v1.Pod, conf *types.NetConf, clientInfo *ClientInfo, resourceMap map[string]*types.ResourceInfo) (int, *ClientInfo, error) {
+	var err error
+
+	logging.Debugf("TryLoadNamespaceDelegates: %v, %v, %v", pod, conf, clientInfo)
+	clientInfo, err = GetK8sClient(conf.Kubeconfig, clientInfo)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	if clientInfo == nil {
+		if len(conf.Delegates) == 0 {
+			// No available kube client and no delegates, we can't do anything
+			return 0, nil, logging.Errorf("TryLoadNamespaceDelegates: must have either Kubernetes config or delegates")
+		}
+		return 0, nil, nil
+	}
+
+	delegate, err := tryLoadK8sNamespaceDefaultNetwork(clientInfo, namespace, pod, conf)
+	if err != nil {
+		return 0, nil, logging.Errorf("TryLoadNamespaceDelegates: error in loading K8s cluster default network from namespace annotation: %v", err)
+	}
+	if delegate != nil {
+		logging.Debugf("TryLoadNamespaceDelegates: Overwrite the cluster default network with %v from namespace annotations", delegate)
+
+		conf.Delegates[0] = delegate
+	}
+
+	nsNetworks, _ := GetNamespaceNetwork(namespace)
+	if nsNetworks != nil {
+		delegates, err := GetNetworkDelegates(clientInfo, pod, nsNetworks, conf.ConfDir, conf.NamespaceIsolation, resourceMap)
+
+		if err != nil {
+			if _, ok := err.(*NoK8sNetworkError); ok {
+				return 0, clientInfo, nil
+			}
+			return 0, nil, logging.Errorf("TryLoadNamespaceDelegates: error in getting k8s network for namespace: %v", err)
+		}
+
+		if err = conf.AddDelegates(delegates); err != nil {
+			return 0, nil, err
+		}
+
+		// Check gatewayRequest is configured in delegates
+		// and mark its config if gateway filter is required
+		isGatewayConfigured := false
+		for _, delegate := range conf.Delegates {
+			if delegate.GatewayRequest != nil {
+				isGatewayConfigured = true
+				break
+			}
+		}
+
+		if isGatewayConfigured == true {
+			types.CheckGatewayConfig(conf.Delegates)
+		}
+
+		return len(delegates), clientInfo, nil
+	}
+
+	return 0, clientInfo, nil
+}
+
 // TryLoadPodDelegates attempts to load Kubernetes-defined delegates and add them to the Multus config.
 // Returns the number of Kubernetes-defined delegates added or an error.
 func TryLoadPodDelegates(pod *v1.Pod, conf *types.NetConf, clientInfo *ClientInfo, resourceMap map[string]*types.ResourceInfo) (int, *ClientInfo, error) {
@@ -435,6 +504,23 @@ func GetPodNetwork(pod *v1.Pod) ([]*types.NetworkSelectionElement, error) {
 	}
 
 	networks, err := parsePodNetworkAnnotation(netAnnot, defaultNamespace)
+	if err != nil {
+		return nil, err
+	}
+	return networks, nil
+}
+
+// GetPodNetwork gets net-attach-def annotation from namespace
+func GetNamespaceNetwork(ns *v1.Namespace) ([]*types.NetworkSelectionElement, error) {
+	logging.Debugf("GetNamespaceNetwork: %v", ns)
+
+	netAnnot := ns.Annotations[networkAttachmentAnnot]
+
+	if len(netAnnot) == 0 {
+		return nil, &NoK8sNetworkError{"no kubernetes network found"}
+	}
+
+	networks, err := parsePodNetworkAnnotation(netAnnot, ns.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -586,6 +672,34 @@ func tryLoadK8sPodDefaultNetwork(kubeClient *ClientInfo, pod *v1.Pod, conf *type
 	delegate, _, err := getKubernetesDelegate(kubeClient, networks[0], conf.ConfDir, pod, nil)
 	if err != nil {
 		return nil, logging.Errorf("tryLoadK8sPodDefaultNetwork: failed getting the delegate: %v", err)
+	}
+	delegate.MasterPlugin = true
+
+	return delegate, nil
+}
+
+func tryLoadK8sNamespaceDefaultNetwork(kubeClient *ClientInfo, ns *v1.Namespace, pod *v1.Pod, conf *types.NetConf) (*types.DelegateNetConf, error) {
+	var netAnnot string
+	logging.Debugf("tryLoadK8sNamespaceDefaultNetwork: %v, %v, %v", kubeClient, ns, conf)
+
+	netAnnot, ok := ns.Annotations[defaultNetAnnot]
+	if !ok {
+		logging.Debugf("tryLoadK8sNamespaceDefaultNetwork: Namespace default network annotation is not defined")
+		return nil, nil
+	}
+
+	// The CRD object of default network should only be defined in multusNamespace
+	networks, err := parsePodNetworkAnnotation(netAnnot, conf.MultusNamespace)
+	if err != nil {
+		return nil, logging.Errorf("tryLoadK8sNamespaceDefaultNetwork: failed to parse CRD object: %v", err)
+	}
+	if len(networks) > 1 {
+		return nil, logging.Errorf("tryLoadK8sNamespaceDefaultNetwork: more than one default network is specified: %s", netAnnot)
+	}
+
+	delegate, _, err := getKubernetesDelegate(kubeClient, networks[0], conf.ConfDir, pod, nil)
+	if err != nil {
+		return nil, logging.Errorf("tryLoadK8sNamespaceDefaultNetwork: failed getting the delegate: %v", err)
 	}
 	delegate.MasterPlugin = true
 
